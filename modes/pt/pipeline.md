@@ -4,7 +4,7 @@ Processa URLs de vagas acumuladas em `data/pipeline.md`. O candidato adiciona UR
 
 ## Workflow
 
-1. **Ler** `data/pipeline.md` → buscar itens `- [ ]` na seção "Pendentes"
+1. **Ler** `data/pipeline.md` (busque com `grep -n -m 20 '^- \[ \] ' data/pipeline.md` e repita a busca após cada lote até mostrar apenas itens que você deixou em Pendentes nesta rodada, não leia o arquivo inteiro) → buscar itens `- [ ]` na seção "Pendentes"
 2. **Para cada URL pendente**:
    a. Reservar o próximo `REPORT_NUM` sequencial de forma atômica executando `node reserve-report-num.mjs` (e liberar o sentinel executando `node reserve-report-num.mjs --release <num>` após a gravação do relatório)
    b. **Extrair JD** usando Playwright (browser_navigate + browser_snapshot) → WebFetch → WebSearch
@@ -37,6 +37,7 @@ Processa URLs de vagas acumuladas em `data/pipeline.md`. O candidato adiciona UR
 ## Detecção inteligente de JD a partir da URL
 
 1. **Playwright (preferido):** `browser_navigate` + `browser_snapshot`. Funciona com todas as SPAs.
+   - **Opcional — extrator CLI (`scan.extractor: cli` em `config/profile.yml`):** execute `node browser-extract.mjs <url>` (`--mode jd`) em vez disso — `{ "url", "title", "text" }` compacto, menos tokens (depende do portal). **Recorre em silêncio** a `browser_navigate` + `browser_snapshot` em caso de erro ou ausência.
 2. **WebFetch (fallback):** Para páginas estáticas ou quando Playwright não está disponível.
 3. **WebSearch (último recurso):** Buscar em portais secundários que indexam o JD.
 

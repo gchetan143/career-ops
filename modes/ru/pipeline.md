@@ -4,7 +4,7 @@
 
 ## Workflow
 
-1. **Прочитать** `data/pipeline.md` → найти `- [ ]` в секции "Ожидающие" (или "Pendientes" / "Pending" — pipeline.md может содержать заголовки на любом языке)
+1. **Прочитать** `data/pipeline.md` (искать через `grep -n -m 20 '^- \[ \] ' data/pipeline.md` и повторять поиск после каждой партии, пока не останутся только пункты, оставленные в Pending в этом проходе, не читать файл целиком) → найти `- [ ]` в секции "Ожидающие" (или "Pendientes" / "Pending" — pipeline.md может содержать заголовки на любом языке)
 2. **Для каждого URL**:
    a. Зарезервировать следующий `REPORT_NUM` атомарно, запустив `node reserve-report-num.mjs` (и освободить маркер, запустив `node reserve-report-num.mjs --release <num>` после записи отчета)
    b. **Извлечь JD** через Playwright → WebFetch → WebSearch
@@ -34,6 +34,7 @@
 ## Определение JD из URL
 
 1. **Playwright (предпочтительно):** `browser_navigate` + `browser_snapshot`. Работает со всеми SPA.
+   - **Опционально — CLI-экстрактор (`scan.extractor: cli` в `config/profile.yml`):** вместо этого запустите `node browser-extract.mjs <url>` (`--mode jd`) — компактный `{ "url", "title", "text" }`, меньше токенов (зависит от портала). При ошибке или отсутствии **молча** откатывайтесь на `browser_navigate` + `browser_snapshot`.
 2. **WebFetch (fallback):** Для статических страниц.
 3. **WebSearch (последний ресурс):** Поиск на вторичных порталах.
 

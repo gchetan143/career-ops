@@ -12,24 +12,47 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
-import yaml from 'js-yaml';
+import { join, dirname, relative, sep } from 'path';
+import { fileURLToPath } from 'url';
+import { loadYaml } from './lib/yaml-document.mjs';
+import { loadCanonicalStates, foldStatusInput } from './tracker-utils.mjs';
+import { resolveColumns, parseTrackerRow, firstLinkTarget } from './tracker-parse.mjs';
+import { getCareerOpsRoot, getProfilePath, resolveTrackerPath } from './path-resolver.mjs';
+import { localToday } from './lib/local-today.mjs';
+import { flagValue, validateFlags } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { parseStatusLog, foldObservations } from './funnel-velocity.mjs';
 
-const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
-  ? join(CAREER_OPS, 'data/applications.md')
-  : join(CAREER_OPS, 'applications.md');
-const FOLLOWUPS_FILE = join(CAREER_OPS, 'data/follow-ups.md');
-const PROFILE_FILE = process.env.CAREER_OPS_PROFILE || join(CAREER_OPS, 'config/profile.yml');
+// templates/states.yml is System Layer — resolved from the codebase, not from
+// the user's data root (#3500).
+const CODEBASE_ROOT = dirname(fileURLToPath(import.meta.url));
+const CAREER_OPS = getCareerOpsRoot();
+const APPS_FILE = resolveTrackerPath(CAREER_OPS);
+
+const FOLLOWUPS_FILE = process.env.CAREER_OPS_FOLLOWUPS || join(CAREER_OPS, 'data/follow-ups.md');
+const STATUS_LOG_FILE = join(dirname(APPS_FILE), 'status-log.tsv');
+const PROFILE_FILE = getProfilePath();
 
 
 // --- CLI args ---
 const args = process.argv.slice(2);
 const summaryMode = args.includes('--summary');
 const overdueOnly = args.includes('--overdue-only');
-const appliedDaysIdx = args.indexOf('--applied-days');
-const appliedDaysOverride = appliedDaysIdx !== -1 ? parseInt(args[appliedDaysIdx + 1], 10) : null;
+// flagValue (not indexOf) so `--applied-days=10` is honored too — indexOf()
+// can't see the `=` form and used to silently discard it, falling back to the
+// default cadence for a value the caller did supply (#2401/#2402 defect class).
+const appliedDaysRaw = flagValue(args, '--applied-days');
+
+// Whole-string match, not a bare parseInt: parseInt('1.5', 10) is 1 and
+// parseInt('10days', 10) is 10 — both truncate a bad value into a plausible
+// one instead of rejecting it, which is the exact silent-wrong-answer shape
+// this file is being fixed to close. Exported so a value's actual numeric
+// effect can be asserted directly, rather than only "the CLI didn't error".
+const APPLIED_DAYS_RE = /^\d+$/;
+export function parseAppliedDaysOverride(raw) {
+  return raw !== undefined && APPLIED_DAYS_RE.test(raw) ? positiveInteger(raw) : null;
+}
+const appliedDaysOverride = parseAppliedDaysOverride(appliedDaysRaw);
 
 // --- Cadence config ---
 export const DEFAULT_CADENCE = {
@@ -51,15 +74,19 @@ const PROFILE_CADENCE_KEYS = {
 };
 
 function positiveInteger(value) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  if (typeof value === 'string') {
+    value = value.trim();
+    if (!/^\+?\d+$/.test(value)) return null;
+    value = Number(value);
+  }
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 export function loadProfileCadence(profilePath = PROFILE_FILE) {
   if (!profilePath || !existsSync(profilePath)) return {};
   let raw;
   try {
-    raw = yaml.load(readFileSync(profilePath, 'utf-8')) || {};
+    raw = loadYaml(readFileSync(profilePath, 'utf-8')) || {};
   } catch {
     return {};
   }
@@ -72,6 +99,18 @@ export function loadProfileCadence(profilePath = PROFILE_FILE) {
   return cadence;
 }
 
+// follow_ups.enabled: false in the profile turns the follow-up features off.
+// Anything else, including a missing or unreadable profile, keeps them on, so
+// an install that never set the key behaves exactly as before.
+export function loadFollowupsEnabled(profilePath = PROFILE_FILE) {
+  if (!profilePath || !existsSync(profilePath)) return true;
+  try {
+    return loadYaml(readFileSync(profilePath, 'utf-8'))?.follow_ups?.enabled !== false;
+  } catch {
+    return true;
+  }
+}
+
 export function resolveCadenceConfig({ profilePath = PROFILE_FILE, appliedDays = appliedDaysOverride } = {}) {
   const cadence = { ...DEFAULT_CADENCE, ...loadProfileCadence(profilePath) };
   const cliApplied = positiveInteger(appliedDays);
@@ -81,37 +120,77 @@ export function resolveCadenceConfig({ profilePath = PROFILE_FILE, appliedDays =
 
 const CADENCE = resolveCadenceConfig();
 
-// --- Status normalization (mirrors verify-pipeline.mjs) ---
-const ALIASES = {
-  'evaluada': 'evaluated', 'condicional': 'evaluated', 'hold': 'evaluated',
-  'evaluar': 'evaluated', 'verificar': 'evaluated',
-  'aplicado': 'applied', 'enviada': 'applied', 'aplicada': 'applied',
-  'applied': 'applied', 'sent': 'applied',
-  'respondido': 'responded',
-  'entrevista': 'interview',
-  'oferta': 'offer',
-  'rechazado': 'rejected', 'rechazada': 'rejected',
-  'descartado': 'discarded', 'descartada': 'discarded',
-  'cerrada': 'discarded', 'cancelada': 'discarded',
-  'no aplicar': 'skip', 'no_aplicar': 'skip', 'monitor': 'skip', 'geo blocker': 'skip',
-};
+// --- Status normalization ---
+//
+// DERIVED from templates/states.yml, not a hand-copy of it. The map that used
+// to live here was already missing every Turkish spelling the Go dashboard
+// recognises, so the same tracker row normalized three different ways: the TUI
+// read `Mülakat` as `interview`, this file left it as `mülakat` (matching no
+// ACTIONABLE/ADVANCED set, so the row silently vanished from the funnel), and
+// the web rejected it outright on writeback. tracker-utils already exposes the
+// loader for exactly this — its docstring says "a new state or alias lands in
+// one file and every consumer follows" — it just had no consumer here (#2704).
+//
+// Cached per process: these are short-lived CLI runs, so a single read is
+// correct. A long-running consumer must NOT copy this pattern — see #2590,
+// where caching states.yml for a server's lifetime pinned a stale roster.
+let aliasMapCache = null;
 
-const ACTIONABLE_STATUSES = ['applied', 'responded', 'interview'];
+/** alias/id/label (lowercased) → canonical lowercase id, from states.yml. */
+function statusAliasMap() {
+  if (aliasMapCache) return aliasMapCache;
+  const map = new Map();
+  try {
+    for (const st of loadCanonicalStates(join(CODEBASE_ROOT, 'templates', 'states.yml'))) {
+      const id = st.id.toLowerCase();
+      map.set(foldStatusInput(id), id);
+      if (st.label) map.set(foldStatusInput(st.label), id);
+      for (const a of st.aliases) map.set(foldStatusInput(a), id);
+    }
+  } catch (err) {
+    // A missing/malformed states.yml is a broken install. Degrade to
+    // identity-normalization rather than resurrecting a hardcoded table: a
+    // fallback copy is the same copy in disguise and drifts the same way.
+    // Report it, though — degrading silently is what hid #3500, and here it
+    // costs every localized status its place in the funnel.
+    console.error(`[followup-cadence] cannot read canonical states from templates/states.yml: ${err.message}`);
+    return (aliasMapCache = new Map());
+  }
+  return (aliasMapCache = map);
+}
+
+const ACTIONABLE_STATUSES = ['applied', 'responded', 'assessment', 'interview'];
 
 export function normalizeStatus(raw) {
-  const clean = raw.replace(/\*\*/g, '').trim().toLowerCase()
-    .replace(/\s+\d{4}-\d{2}-\d{2}.*$/, '').trim();
-  return ALIASES[clean] || clean;
+  // foldStatusInput, not a bare toLowerCase: JS lowercases the Turkish dotted
+  // capital `İ` to `i` + U+0307 and the mark survives, so every all-caps
+  // Turkish row missed every alias (#2704 review).
+  const clean = foldStatusInput(String(raw).replace(/\s+\d{4}-\d{2}-\d{2}.*$/, ''));
+  return statusAliasMap().get(clean) || clean;
 }
 
 // --- Date helpers ---
 function today() {
-  return new Date(new Date().toISOString().split('T')[0]);
+  // LOCAL calendar day, UTC midnight anchor. toISOString() gives the UTC DAY,
+  // so west of Greenwich an evening run answered "today" with tomorrow and
+  // every daysSinceApp came out one high — the follow-up came due a day early
+  // (#3070). Same fix as followup-seed (#2765) and set-status (#2932).
+  //
+  // The arithmetic below is unchanged: parseDate() still anchors at UTC
+  // midnight, so only WHICH day this is moves.
+  return new Date(localToday());
 }
 
 export function parseDate(dateStr) {
   if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr.trim())) return null;
-  return new Date(dateStr.trim());
+  const s = dateStr.trim();
+  const d = new Date(s);
+  // Reject impossible calendar dates (2026-13-45, 2026-02-31): they match the
+  // regex but produce an Invalid Date, which is TRUTHY — without this check it
+  // slips through `if (!date)` guards and addDays().toISOString() throws,
+  // killing the whole analysis over one bad row.
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s) return null;
+  return d;
 }
 
 // The tracker `date` column is often the evaluation date, while the real
@@ -119,10 +198,460 @@ export function parseDate(dateStr) {
 // "APPLIED ..."). Prefer that so cadence reflects when the application actually
 // went out, not when the role was evaluated. Returns the first such date, or
 // null when the notes don't carry one (caller falls back to the date column).
-export function parseAppliedDate(notes) {
+//
+// The optional `~` accepts an estimated date ("Applied ~2026-06-09"), which is
+// how an apply date reconstructed after the fact gets written. Skipping those
+// silently fell back to the evaluation date — the exact wrong-age failure this
+// lookup exists to prevent. The leading \b still refuses "reapplied".
+//
+// A bounded gap between "applied" and the date covers the channel phrasing
+// career-ops' own apply modes write -- "Applied via Ashby 2026-08-31",
+// "Applied on 2026-08-25 via Ashby" -- which the original adjacent-only match
+// missed entirely, silently degrading to the evaluation-date fallback on the
+// exact notes this project generates (#4084). Bounded to 40 chars total and
+// unable to cross a sentence boundary (`.`/`;`/`?`/`!`) or a line break so it
+// cannot reach into a neighbouring sentence or a different requisition's
+// date; the clause model below reuses the same source, so what counts as a
+// date there cannot drift from what this one actually matches.
+//
+// The {0,39} quantifier, not {0,40}: the mandatory separator right after it
+// is part of the gap too, so the true maximum distance between "applied" and
+// the date is quantifier-plus-one. Two CodeRabbit rounds on #4143:
+//   - `?`/`!` join `.`/`;` as sentence boundaries the gap cannot cross --
+//     "Applied? 2026-08-31" no longer reaches a foreign date.
+//   - The mandatory separator is [^\S\r\n\u2028\u2029] (whitespace that is
+//     not itself a line terminator), not \s: \s matches \r/\n/U+2028/U+2029
+//     the same as a space, so "Applied via Ashby\n2026-08-31" would have
+//     matched even with the gap itself excluding line terminators -- the
+//     separator character is the one place a line break could still sneak
+//     through.
+const APPLIED_DATE_SOURCE = String.raw`\bapplied\b[^.;?!|\r\n\u2028\u2029]{0,39}?[^\S\r\n\u2028\u2029]~?(\d{4}-\d{2}-\d{2})(?![\w-])`;
+const APPLIED_DATE_RE = new RegExp(APPLIED_DATE_SOURCE, 'gi');
+
+// The trailing (?![\w-]) is the mirror of that leading \b: without it a
+// malformed value ("2026-06-091", "2026-06-09-2026-06-10") is truncated to a
+// plausible-looking date and then reported as a *measured* apply date. That is
+// worse than no match at all — the evaluation-date fallback is at least labelled
+// as inferred, whereas a truncated date is indistinguishable from a real one.
+// Rejecting the bad candidate lets the scan continue to a later valid date.
+//
+// The token shape is necessary but not sufficient: "2026-06-31" and
+// "2026-02-30" match it and are not real days.
+//
+// Whether that should be rejected here depends on the caller, so it is opt-in:
+//   - followup-seed.mjs WANTS the raw candidate. It validates the date itself
+//     and throws INVALID_DATE so a typo gets corrected rather than silently
+//     absorbed — pinning a follow-up off a wrong date is worse than refusing.
+//     Filtering here unconditionally would make that impossible date invisible
+//     to it and turn a loud, fixable error into a silent wrong answer.
+//   - the cadence report wants it skipped, because parseDate() rolls an
+//     impossible date over (2026-06-31 becomes 2026-07-01), so it would become
+//     a real but WRONG date labelled `notes` — i.e. measured, not inferred.
+//     Falling back to the evaluation date is honest by comparison, and one bad
+//     row must not fail a whole report.
+//
+// @param {string} notes
+// @param {{requireValidCalendarDate?: boolean}} [options]
+export function parseAppliedDate(notes, options = {}) {
   if (!notes) return null;
-  const m = String(notes).match(/\bapplied\s+(\d{4}-\d{2}-\d{2})/i);
-  return m ? m[1] : null;
+  const validateCalendar = options.requireValidCalendarDate === true;
+  const text = String(notes);
+
+  // Every SYNTACTIC match, impossible days included. Attribution runs over all
+  // of them and `validateCalendar` applies only to what may be returned, below.
+  // Filtering here instead hid an impossible date from the clause model, which
+  // then read the clause citing it as undated -- so "row 51 applied 2026-02-30;
+  // Applied 2026-06-17" carried row 51's scope into the next clause and
+  // discarded a valid own date, reporting the note as stating no date at all.
+  // A typo in a citation is still the citation's; it must not cost this row its
+  // own measured date.
+  const matches = [];
+  for (const m of text.matchAll(APPLIED_DATE_RE)) {
+    matches.push({ date: m[1], index: m.index, end: m.index + m[0].length });
+  }
+  if (matches.length === 0) return null;
+
+  // Drop dates that belong to a DIFFERENT row before choosing. Notes routinely
+  // cite a sibling requisition's timeline for context — "#154 is already live
+  // in the same ATS (applied 2026-08-04)" — and that citation reads exactly
+  // like this row's own apply date to a positional scan (#2607). The citation
+  // is as often written in prose ("...(row 51, 4.6/5)"), and it can sit before,
+  // inside or after the match it belongs to, so attribution is decided by the
+  // clause model below rather than by scanning outward from each date (#4953).
+  const cited = citedDateOffsets(text, matches);
+  const own = matches.filter(m => !cited.has(m.index)
+    && (!validateCalendar || isRealCalendarDate(m.date)));
+
+  // First-wins is preserved among a row's OWN dates: a later status date must
+  // not displace the submission date (see the fixture in test-all.mjs).
+  // Cross-reference filtering is orthogonal to that ordering rule.
+  if (own.length > 0) return own[0].date;
+
+  // Every apply-date in the note belongs to another row, so this note does not
+  // state when THIS row was submitted. Returning null is the honest answer —
+  // the alternative is reporting a real but foreign date as
+  // `appDateSource: 'notes'`, i.e. measured, which is precisely the failure the
+  // header comment warns about.
+  //
+  // Both consumers degrade to a LABELLED evaluation-date fallback:
+  // resolveAppliedDate below reports `appDateSource: 'evaluation-date-fallback'`,
+  // and followup-seed.mjs reports `appDateSource: 'evaluation-date'`. That was
+  // not true when this was written — seed fell through to today(), unlabelled,
+  // which made an old application look new and silently reset its follow-up
+  // clock. #2607 changed seed's fallback so the claim below actually holds.
+  return null;
+}
+
+// --- Which apply-date belongs to THIS row ---------------------------------
+//
+// Notes routinely cite a SIBLING requisition's timeline for context, and that
+// citation reads exactly like this row's own date to a positional scan (#2607).
+// The job here is attribution: for each "applied YYYY-MM-DD" in a note, decide
+// whether it is this row's or a cited row's.
+//
+// This was first done with a lookback window plus a set of scope rules, then
+// with a lookback, a forward bracket scan, and more scope rules (#4953). Two
+// review rounds found fourteen genuine misattributions between them, because
+// every new rule interacted with the others: a rule about semicolons had to
+// know about brackets, a rule about brackets had to know where a clause ended,
+// and a date could be claimed by a pointer the other direction's rule had
+// already dismissed. Patching that converges slowly, if at all.
+//
+// So attribution is now ONE pass over a single model:
+//
+//   1. The note is split into CLAUSES on a sentence break, `;`, `|` or a line
+//      break -- the separators this Notes column actually uses.
+//   2. Inside a clause, each "applied ... date" match owns a SEGMENT running
+//      from its own "applied" to the next one (or the clause's end).
+//   3. Every row pointer in the clause is attributed to exactly one date (see
+//      pointerOwner below), and that date is the cited row's, not this row's.
+//   4. ONE cross-clause rule: an undated pointer's subject carries into the
+//      next clause, and only across a `;` or `|`.
+//
+// Everything the old scope rules expressed falls out of that, which is the
+// point: there is one place where attribution is decided, so a new case is a
+// new test rather than a new rule.
+//
+// The two failure directions are not symmetric, and the module's original
+// doctrine is that a tie goes to "cited": a false positive degrades to a date
+// LABELLED as not-measured, while a false negative reports another row's date
+// as this row's MEASURED one. That holds for genuinely ambiguous notes. It is
+// not a licence to drop a date a reader would call unambiguous -- see the
+// `pointerOwner` and carry notes for the two places that distinction decides.
+
+// The spellings of a row pointer. `#NNN` was the only one the guard knew, and
+// notes name a sibling in prose at least as often -- "(row 51, 4.6/5)".
+//
+// The WORD is the discriminator for the prose form, and that is what makes it
+// safe: a bare number after a bare word is NOT a pointer, because "Req 1311",
+// "job 88214" and "posting 4001" are this row's own ATS identifier. Requiring
+// the literal word needs no label exemption of the kind `#NNN` needs.
+//
+// `\b` before the word, so "arrow 51" and "narrow 51" cannot match; the digit
+// run is bounded to 4, since a tracker `#` is 1-4 digits; and the trailing
+// guard refuses the YEAR of an ISO date, which `\b` alone accepts -- without it
+// "Data entry 2026-08-05" matched "entry 2026". It rejects only a full date
+// continuation, so "row 51-52" is still a pointer.
+const ROW_WORD_REF = String.raw`\b(?:rows?|entr(?:y|ies))[\s:]*#?\s*\d{1,4}\b(?!-\d{2}-\d{2})`;
+const CROSS_REF_TOKEN_RE = new RegExp(String.raw`(?<![\w-])#\d+\b|${ROW_WORD_REF}`, 'gi');
+
+// A `#NNN` immediately preceded by a req/job/posting/reference label is an ATS
+// identifier for THIS row, not a pointer at another tracker row. Anchored at the
+// end so it only matches a label sitting directly before the `#`, and the
+// separator excludes `.!?` so a sentence boundary cannot be swallowed into it.
+// Same vocabulary as tracker-parse.mjs's REQ_NUMBER_RE (used by merge-tracker.mjs), which reads the same
+// Notes column.
+const REQ_LABELLED_HASH_RE = /\b(?:job\s*id|posting\s*id|requisition|req|jr|job|posting|ref(?:erence)?|r_)[\s:_-]*$/i;
+
+// Clause boundaries. A sentence break needs trailing whitespace, so "4.6/5" and
+// "e.g." are not boundaries; `;` and `|` never appear inside numbers or
+// abbreviations, so they stand alone, and a hand-typed note writes ";applied"
+// as readily as "; applied".
+//
+// `soft` (`;`/`|`) is the only boundary a pointer's subject can carry across --
+// a semicolon joins independent clauses within one sentence, so the subject
+// survives it. A sentence break or a line break is `hard` and always ends it.
+const CLAUSE_SPLIT_RE = /[.!?]\s|[;|]|[\r\n\u2028\u2029]+/g;
+
+function splitClauses(text) {
+  const clauses = [];
+  let start = 0;
+  let sepBefore = null;
+  CLAUSE_SPLIT_RE.lastIndex = 0;
+  let m = CLAUSE_SPLIT_RE.exec(text);
+  while (m !== null) {
+    clauses.push({ start, end: m.index, sepBefore });
+    sepBefore = /^[;|]$/.test(m[0]) ? 'soft' : 'hard';
+    start = m.index + m[0].length;
+    m = CLAUSE_SPLIT_RE.exec(text);
+  }
+  clauses.push({ start, end: text.length, sepBefore });
+  return clauses;
+}
+
+// Where an UNFINISHED bracket group starts within [from, to), or -1.
+//
+// Everything from there to the end of the clause is ignored when looking for
+// pointers: an unterminated aside is not a citation, so
+// "Applied 2026-11-20 (compare with row 51" keeps its date. Depth-matched, so a
+// nested group does not end the outer one early -- scanning for the first `)`
+// read "(via Ashby (US), row 51)" as closing after "US" and missed the pointer.
+function unclosedGroupStart(text, from, to) {
+  const stack = [];
+  for (let i = from; i < to; i += 1) {
+    const ch = text[i];
+    if (ch === '(' || ch === '[') stack.push(i);
+    else if ((ch === ')' || ch === ']') && stack.length > 0) stack.pop();
+  }
+  return stack.length > 0 ? stack[0] : -1;
+}
+
+// Where the bracket group that `at` sits in ends within [from, to), or -1 when
+// `at` is not inside one. The offset just past the closing bracket, so it can
+// be compared with a date's offset directly.
+//
+// The group rather than the pointer, because direction is a property of the
+// whole aside: "(row 51, row 52) applied 2026-09-20" has two pointers in one
+// group, and measuring from each pointer gave them opposite directions --
+// "row 51" read the comma before "row 52" as the end of an appositive while
+// "row 52" sat against the verb. One group, one reading.
+//
+// The INNERMOST group containing it, which is that same group: an enclosing
+// one is somebody else's punctuation, and reading from it let any wrapper
+// change the answer -- parenthesising a whole note turned
+// "(Applied 2026-09-20 elsewhere (row 51), applied 2026-11-20 here)" into a
+// forward read, so the sibling's September came back as this row's date while
+// the bare note answered November. Pointers that share a group still share
+// their innermost one, so one direction per group survives.
+function bracketGroupEnd(text, from, to, at) {
+  let depth = 0;
+  let depthAt = -1;
+  for (let i = from; i < to; i += 1) {
+    const ch = text[i];
+    if (ch === '(' || ch === '[') {
+      depth += 1;
+    } else if ((ch === ')' || ch === ']') && depth > 0) {
+      if (depth === depthAt) return i + 1;
+      depth -= 1;
+    }
+    if (i === at) {
+      if (depth === 0) return -1;
+      depthAt = depth;
+    }
+  }
+  return -1;
+}
+
+// The row pointers in [from, to), with absolute offsets.
+function pointersIn(text, from, to) {
+  const unclosed = unclosedGroupStart(text, from, to);
+  const limit = unclosed === -1 ? to : unclosed;
+  const scope = text.slice(from, limit);
+  const found = [];
+  for (const m of scope.matchAll(CROSS_REF_TOKEN_RE)) {
+    const at = from + m.index;
+    // The lookbehind cannot see past the slice, so a token on the scope's first
+    // character is checked against the original note. Applies to the word form
+    // too: a scope starting mid-word would let `\b` assert at offset 0 and read
+    // "arrow 51" as "row 51".
+    if (m.index === 0 && /[\w-]/.test(text[from - 1] ?? '')) continue;
+    // Only `#NNN` can be an ATS identifier for this row. "Req #1311 - applied
+    // 2026-08-06" is this row's own posting id followed by this row's own date,
+    // and reading it as a citation would discard a genuine date. The label
+    // vocabulary is the one merge-tracker.mjs already recognises in this same
+    // Notes column, kept in sync by being written the same way rather than
+    // imported -- merge-tracker's regex also captures the id itself.
+    if (m[0].startsWith('#') && REQ_LABELLED_HASH_RE.test(text.slice(from, at))) continue;
+    const groupEnd = bracketGroupEnd(text, from, limit, at);
+    found.push({ index: at, text: m[0], bracketed: groupEnd !== -1, groupEnd });
+  }
+  return found;
+}
+
+// Which date in this clause a pointer is citing, or null if it cites none.
+//
+// An UNBRACKETED pointer is the subject of the "applied" that follows it:
+// "row 51 (other Staff req, applied 2026-09-20)", "#154 Sr PM (applied
+// 2026-08-04)". That also settles a pointer sitting between two dates, which is
+// the reading a comma cannot separate: in "Applied 2026-11-20 and row 51
+// applied 2026-09-20" the pointer is the subject of the second "applied", so
+// November stays this row's. With no date after it, it cites nothing --
+//
+//   "APPLIED 2026-11-13 via the Ashby form (...), same day as #267"
+//        prose commentary COMPARING this submission with a sibling's. The date
+//        is this row's own, and citing it discards a real measured date. Found
+//        on a real tracker row by replaying the model over it.
+//
+// A BRACKETED pointer is an appositive, so it attaches BACKWARD: it cites the
+// segment it sits in or just after, and only a pointer with no segment before
+// it reaches forward ("Applied to their other req (row 51) on 2026-09-20" is
+// inside September's own segment, so backward and forward agree there).
+//
+//   "applied 2026-09-20 to their other Staff req (row 51, 4.6/5)"
+//        the shape the guard exists for: an aside on the clause just read.
+//
+//   "Applied 2026-09-20 elsewhere (row 51), applied 2026-11-20 here"
+//        the same aside with a second application after it. Letting the
+//        following date claim the pointer cited November and returned the
+//        sibling's September as this row's measured date.
+//
+// Direction, not distance, is what the two differ by, so the rule is which way
+// a bracket faces rather than how far a scan may run.
+function pointerOwner(text, pointer, dates) {
+  // Inside an "applied ... date" span, the pointer names what that application
+  // was for, so it owns that date whatever its form or punctuation.
+  const containing = dates.find(d => pointer.index >= d.index && pointer.index < d.end);
+  if (containing) return containing;
+
+  const following = dates.find(d => d.index > pointer.index) ?? null;
+
+  // Past the end of a span, a bracketed appositive attaches backward -- in the
+  // WORD form only. Nobody writes "row 51" for a requisition, but a bare
+  // "(#1311)" after a date routinely IS this row's own posting id, and citing
+  // it discards a real measured date.
+  if (pointer.bracketed && !pointer.text.startsWith('#')) {
+    // Unless its own closing bracket is all that stands between it and the next
+    // application, in which case it is that application's SUBJECT rather than
+    // an aside on the one before: an appositive is closed off by punctuation,
+    // a subject sits against its verb. That is the whole difference between
+    //   "Applied 2026-09-20 elsewhere (row 51), applied 2026-11-20 here"
+    //   "Applied 2026-11-20 and (row 51) applied 2026-09-20"
+    // which read the opposite ways round and are otherwise identical: a
+    // bracketed pointer with a segment on either side of it.
+    // Measured from the end of the GROUP, so every pointer inside one bracket
+    // reads the same way. A date inside the group is the group's own, which is
+    // the subject reading too: "(row 51 applied 2026-09-20)".
+    //
+    // The gap may contain the closing brackets of ENCLOSING groups, since those
+    // are not punctuation this aside chose: "((row 51)) applied 2026-09-20"
+    // leaves a `)` to climb out of before reaching the verb. Nothing else
+    // passes -- a comma, prose, or a further group opening in the gap all mean
+    // the pointer is not sitting against that verb.
+    const subjectOfFollowing = following !== null
+      && (following.index < pointer.groupEnd
+        || /^[)\]\s]*$/.test(text.slice(pointer.groupEnd, following.index)));
+    if (!subjectOfFollowing) {
+      const preceding = dates.filter(d => d.index < pointer.index).pop();
+      if (preceding) return preceding;
+    }
+  }
+
+  return following;
+}
+
+// The apply-dates in `text` that are being cited about ANOTHER row, as a Set of
+// their offsets.
+function citedDateOffsets(text, matches) {
+  const cited = new Set();
+  const clauses = splitClauses(text).map(c => ({
+    ...c,
+    dates: matches.filter(m => m.index >= c.start && m.index < c.end),
+    pointers: pointersIn(text, c.start, c.end),
+  }));
+
+  for (let i = 0; i < clauses.length; i += 1) {
+    const clause = clauses[i];
+
+    for (const pointer of clause.pointers) {
+      const owner = pointerOwner(text, pointer, clause.dates);
+      if (owner) cited.add(owner.index);
+    }
+
+    if (clause.dates.length === 0) continue;
+
+    // The one cross-clause rule. An UNDATED pointer's subject carries into the
+    // next clause, across a `;` or `|` only:
+    //
+    //   "#154 is already live; applied 2026-08-04"
+    //        the citation has no date yet, so the one after the separator is
+    //        still its own.
+    //
+    //   "#154 Sr PM (applied 2026-08-04); applied 2026-06-15"
+    //        the citation already carries its date, so it is satisfied and the
+    //        second date is a new subject -- this row's own. This is the more
+    //        common shape: two roles live at one employer, and the note naming
+    //        the sibling is the same note recording this submission.
+    //
+    // It reaches exactly one clause. A pointer four clauses back, with
+    // unrelated clauses in between, is not stating when this row was submitted:
+    // a tracker row read "...not row 39 (a different employer); no prior
+    // application there; one-active-application policy unverified; posted:
+    // 2026-10-29; Applied 2026-10-30 via Greenhouse", and carrying that scope
+    // discarded a date no reader would call ambiguous.
+    //
+    // KNOWN LIMIT, and the reason this rule is structural rather than clever:
+    // "Sibling #154 is live; same ATS; applied 2026-08-04 to that sibling" also
+    // stops carrying, so that date is reported as this row's. Telling it apart
+    // from the row above needs the anaphora ("to that sibling") read, and the
+    // attempt to do so by matching such wording produced three fresh
+    // misattributions of its own -- including discarding a real date from
+    // "Applied 2026-08-04 for this role", where the wording names the CURRENT
+    // row. One documented limit in the cheaper direction beats three bugs.
+    const previous = clauses[i - 1];
+    if (
+      clause.sepBefore === 'soft'
+      && previous
+      && previous.pointers.length > 0
+      && previous.dates.length === 0
+    ) {
+      for (const d of clause.dates) cited.add(d.index);
+    }
+  }
+
+  return cited;
+}
+
+// True only when YYYY-MM-DD names a day that exists. Round-tripping through a
+// UTC Date and comparing the parts back catches out-of-range months/days as
+// well as month-length and leap-year violations, which a range check misses.
+export function isRealCalendarDate(iso) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(iso ?? ''))) return false;
+  const [y, mo, d] = iso.split('-').map(Number);
+  if (mo < 1 || mo > 12 || d < 1) return false;
+  // setUTCFullYear rather than Date.UTC: Date.UTC maps years 0-99 onto
+  // 1900-1999, which would reject a literal ISO year below 0100 (0096-02-29 is
+  // a real leap day). The absolute setter keeps the year as written.
+  const dt = new Date(0);
+  dt.setUTCFullYear(y, mo - 1, d);
+  dt.setUTCHours(0, 0, 0, 0);
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
+// The day each row moved to Applied, read with funnel-velocity.mjs's ledger
+// rules so corrections and retractions resolve the same way in both reports.
+export function statusLogAppliedDates(statusLogContent) {
+  const dates = new Map();
+  if (!statusLogContent) return dates;
+  let states;
+  try {
+    states = loadCanonicalStates(join(CODEBASE_ROOT, 'templates', 'states.yml'));
+  } catch (err) {
+    console.error(`[followup-cadence] cannot read canonical states, ignoring status-log.tsv: ${err.message}`);
+    return dates;
+  }
+  for (const [num, timeline] of foldObservations(parseStatusLog(statusLogContent, states).observations)) {
+    const applied = timeline.filter(o => o.to === 'Applied' && o.dayMath && isRealCalendarDate(o.date)).pop();
+    if (applied) dates.set(num, applied.date);
+  }
+  return dates;
+}
+
+// Which date the cadence is measured from, and where it came from. A caller
+// cannot otherwise tell a real application date from the evaluation-date proxy,
+// so an inferred age reads exactly like a measured one — and acting on that
+// silently-wrong number is what pushes a live application into "cold".
+//
+// Notes rank above the ledger, as in followup-seed.mjs: a transition logged
+// without --on carries the day it was logged, not the day it was sent.
+export function resolveAppliedDate(app, statusLogDate = null) {
+  // requireValidCalendarDate: an impossible date in the notes must degrade to
+  // the labelled fallback rather than be reported as a measured date. One bad
+  // row must not fail the whole report, so this skips rather than throws —
+  // unlike followup-seed.mjs, which refuses to pin a follow-up off a bad date.
+  const fromNotes = parseAppliedDate(app?.notes, { requireValidCalendarDate: true });
+  if (fromNotes) return { appliedDate: fromNotes, appDateSource: 'notes' };
+  if (statusLogDate) return { appliedDate: statusLogDate, appDateSource: 'status-log' };
+  return { appliedDate: app?.date ?? null, appDateSource: 'evaluation-date-fallback' };
 }
 
 export function daysBetween(d1, d2) {
@@ -130,86 +659,364 @@ export function daysBetween(d1, d2) {
 }
 
 export function addDays(date, days) {
+  // Null-safe: parseDate() returns null for unparseable/impossible dates —
+  // degrade to "no scheduled date" instead of crashing (new Date(null) would
+  // silently be the 1970 epoch).
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return null;
   const result = new Date(date);
   result.setUTCDate(result.getUTCDate() + days);
   return result.toISOString().split('T')[0];
 }
 
 // --- Parse applications.md ---
-function parseTracker() {
-  if (!existsSync(APPS_FILE)) return [];
-  const content = readFileSync(APPS_FILE, 'utf-8');
+// Content-based core so any consumer (stats.mjs, tests) can classify rows
+// from in-memory strings without touching disk. The disk-backed wrapper
+// below is what the CLI path uses.
+function parseTrackerContent(content) {
+  const lines = String(content ?? '').split('\n');
+  const parseOptions = { allowTabs: true, allowIndentation: true };
+  const colmap = resolveColumns(lines, parseOptions);
   const entries = [];
-  for (const line of content.split('\n')) {
-    if (!line.startsWith('|')) continue;
-    const parts = line.split('|').map(s => s.trim());
-    if (parts.length < 9) continue;
-    const num = parseInt(parts[1]);
-    if (isNaN(num)) continue;
-    entries.push({
-      num, date: parts[2], company: parts[3], role: parts[4],
-      score: parts[5], status: parts[6], pdf: parts[7], report: parts[8],
-      notes: parts[9] || '',
-    });
+  for (const line of lines) {
+    const row = parseTrackerRow(line, colmap, parseOptions);
+    if (row) entries.push(row);
   }
   return entries;
 }
 
 // --- Parse follow-ups.md ---
-function parseFollowups() {
-  if (!existsSync(FOLLOWUPS_FILE)) return [];
-  const content = readFileSync(FOLLOWUPS_FILE, 'utf-8');
+// Two formats coexist in the log (both append-only):
+//   1. Table rows:  | num | appNum | date | company | role | channel | contact | notes |
+//   2. Legacy bullets written by early web builds: `- YYYY-MM-DD · #NUM Company — note`
+// Bullets carry no channel/contact/role (mapped to Other/''/''), and bullets
+// without a `#NUM` are skipped — they can't be attributed to an application.
+// Pin-directive lines (`- next #...`) and the header/separator rows are also
+// excluded — the header's `num` cell isn't numeric and the separator's dashes
+// aren't either, so both fail the `isNaN` check below and never enter `entries`.
+const BULLET_RE = /^-\s+(\d{4}-\d{2}-\d{2})\s+·\s+#(\d+)\s+(.+?)(?:\s+—\s+(.*))?$/;
+
+export function parseFollowups(content) {
   const entries = [];
-  for (const line of content.split('\n')) {
-    if (!line.startsWith('|')) continue;
-    const parts = line.split('|').map(s => s.trim());
-    if (parts.length < 8) continue;
-    const num = parseInt(parts[1]);
-    if (isNaN(num)) continue;
+  for (const line of String(content ?? '').split('\n')) {
+    if (line.startsWith('|')) {
+      const parts = line.split('|').map(s => s.trim());
+      if (parts.length < 8) continue;
+      const num = parseInt(parts[1]);
+      if (isNaN(num)) continue;
+      const appNum = parseInt(parts[2]);
+      if (isNaN(appNum)) continue; // unattributable row would poison per-app grouping
+      entries.push({
+        num,
+        appNum,
+        date: parts[3],
+        company: parts[4],
+        role: parts[5],
+        channel: parts[6],
+        contact: parts[7],
+        notes: parts[8] || '',
+      });
+      continue;
+    }
+    const m = line.match(BULLET_RE);
+    if (!m) continue;
     entries.push({
-      num,
-      appNum: parseInt(parts[2]),
-      date: parts[3],
-      company: parts[4],
-      role: parts[5],
-      channel: parts[6],
-      contact: parts[7],
-      notes: parts[8] || '',
+      num: null,
+      appNum: parseInt(m[2]),
+      date: m[1],
+      company: m[3],
+      role: '',
+      channel: 'Other',
+      contact: '',
+      notes: m[4] || '',
     });
   }
   return entries;
 }
 
-// --- Extract contacts from notes ---
-function extractContacts(notes) {
-  if (!notes) return [];
-  const contacts = [];
-  const emailRegex = /[\w.-]+@[\w.-]+\.\w+/g;
-  const emails = notes.match(emailRegex) || [];
-  for (const email of emails) {
-    // Try to extract name before email: "Emailed Name at" or "contact: Name"
-    let name = null;
-    const beforeEmail = notes.substring(0, notes.indexOf(email));
-    const nameMatch = beforeEmail.match(/(?:Emailed|emailed|contact[:\s]+|to\s+)([A-Z][a-z]+ ?[A-Z]?[a-z]*)\s*(?:at|@|$)/i);
-    if (nameMatch) name = nameMatch[1].trim();
-    contacts.push({ email, name });
+// `parseFollowups` is the disk-agnostic content parser upstream/main and its
+// callers use internally (analyzeFromContent, external scripts); the branch's
+// test-all.mjs imports it as `parseFollowupsContent`. Same function, two names.
+export { parseFollowups as parseFollowupsContent };
+
+// --- Next-date overrides (pins) ---
+// A user can PIN an application's next follow-up date, taking precedence over
+// the computed cadence (a pin even revives a cold application) until a
+// follow-up logged on/after the pin's set-date resumes the normal schedule.
+// Stored in data/follow-ups.md as directive lines:
+//   - next #42 2026-07-10 (set 2026-07-02)
+//   - next #42 2026-07-10 (set 2026-07-02) — why the date was pinned
+// The `(set …)` part records when the pin was made; if omitted (hand-written)
+// it defaults to the pinned date itself. The LAST pin line per application wins.
+//
+// A trailing `— note` is accepted and ignored. Pins are written by hand as
+// often as by `followup-seed.mjs`, and a hand-written pin almost always wants
+// to record WHY the date moved. Anchoring the pattern immediately after the
+// `(set …)` group made every annotated pin fail to match — silently, since a
+// non-matching line is indistinguishable from an ordinary bullet. The failure
+// mode is the dangerous direction: the pin vanishes, the computed cadence
+// takes over, and the application reports overdue when the user had
+// explicitly deferred it.
+const OVERRIDE_RE = /^-\s+next\s+#(\d+)\s+(\d{4}-\d{2}-\d{2})(?:\s+\(set\s+(\d{4}-\d{2}-\d{2})\))?(?:\s*[—–-].*)?\s*$/i;
+
+export function parseNextOverrides(content) {
+  const byApp = new Map();
+  for (const line of content.split('\n')) {
+    const m = line.match(OVERRIDE_RE);
+    if (!m) continue;
+    const date = m[2];
+    if (!parseDate(date)) continue; // an impossible pinned date never poisons the analysis
+    const appNum = parseInt(m[1]);
+    byApp.set(appNum, { appNum, date, setDate: m[3] || date });
   }
-  return contacts;
+  return byApp;
+}
+
+// The pin applies until a follow-up is logged AFTER it. Ties favor the pin:
+// "log a follow-up, then pin the next date" is the common same-day flow.
+export function resolveNextOverride(override, lastFollowupDate) {
+  if (!override) return null;
+  if (lastFollowupDate && lastFollowupDate > override.setDate) return null;
+  return override.date;
+}
+
+// --- Retire directives ---
+// Not every application has a reachable human behind it. A cold ATS submission
+// with no contact on file has no follow-up channel at all, yet the cadence
+// keeps reporting it overdue every week forever. A dashboard whose overdue
+// count is mostly un-actionable rows trains the user to stop reading it, which
+// costs far more than the rows themselves.
+//
+// A retire directive drops ONE application out of the cadence:
+//   - cleared #42 2026-08-04 — no contact on file, no warm path
+// The date records when the retirement was made. This closes the follow-up
+// loop only — it does NOT close the application. The tracker row keeps its
+// status and any inbound reply is still caught by reply-watch.
+//
+// Like a pin, a retirement is revoked by a follow-up logged after it, so
+// re-engaging a retired application resumes its normal cadence with no
+// bookkeeping. The LAST directive per application wins, and a retirement
+// outranks a pin on the same application: retiring is the more explicit
+// "stop surfacing this", and reviving it is a one-line edit either way.
+const CLEARED_RE = /^-\s+cleared\s+#(\d+)\s+(\d{4}-\d{2}-\d{2})(?:\s*[—–-].*)?\s*$/i;
+
+export function parseClearedDirectives(content) {
+  const byApp = new Map();
+  for (const line of String(content ?? '').split('\n')) {
+    const m = line.match(CLEARED_RE);
+    if (!m) continue;
+    const setDate = m[2];
+    if (!parseDate(setDate)) continue; // an impossible date never poisons the analysis
+    const appNum = parseInt(m[1]);
+    byApp.set(appNum, { appNum, setDate });
+  }
+  return byApp;
+}
+
+// Mirrors resolveNextOverride's revival rule, including the same-day tie:
+// "log a final follow-up, then retire" is the common flow, so a follow-up
+// dated the same day as the retirement does not undo it.
+export function isRetired(cleared, lastFollowupDate) {
+  if (!cleared) return false;
+  if (lastFollowupDate && lastFollowupDate > cleared.setDate) return false;
+  return true;
+}
+
+// --- Extract contacts from notes ---
+// Outreach recorded in notes is usually a NAME, not an email — LinkedIn, the
+// most common channel, never produces one. An email-only parser therefore
+// reports `contacts: []` for rows that do have a human attached, and "no
+// contact" becomes indistinguishable from "contact with no email on file".
+// That inverts the meaning of the field: an empty list reads as "outreach is
+// untried here" when outreach has in fact been tried and has not converted.
+//
+// Emitted shape is `{ name, email, channel }`. `email` stays first-class (and
+// remains non-null for email contacts) so existing consumers keep working;
+// `channel` is additive.
+// `+` must be in the local part. \w is [A-Za-z0-9_], so the previous class silently TRUNCATED a
+// plus-addressed address at the plus — `mayank+6a88…@reply.cutshort.io` was captured as
+// `6a88…@reply.cutshort.io`, a different mailbox that would bounce. Recruiting platforms route
+// replies through exactly this form (CutShort, Greenhouse, Lever, Workable all use
+// `name+token@reply.domain`), so the addresses most worth capturing were the ones being corrupted
+// — and corrupted into something that still looks like a valid address, so nothing notices.
+const EMAIL_RE = /[\w.+%-]+@[\w.-]+\.\w+/g;
+
+// Name-shaped contacts are gated on an explicit outreach verb or role word, so
+// a capitalized company name ("Acme Corp") can never be mistaken for a person.
+// Both name parts allow an internal hyphen or apostrophe ("Mary-Jane
+// O'Brien") — dropping such a name would report "no contact" for a row that
+// plainly names a person, the very silence this parser exists to remove.
+const OUTREACH_NAME_RE = /\b(?:recruiter|hiring manager|messaged|contacted|emailed|called|reached out to|spoke with|outreach)\b[\s(]*([A-Z][a-z]*(?:[-'’][A-Z]?[a-z]+)*(?:\s+[A-Z][a-z]*(?:[-'’][A-Z]?[a-z]+)*)+)/g;
+
+// One note can record several separate outreach events ("Messaged X on
+// LinkedIn; called Y"). Resolving a contact against the WHOLE note attributes
+// the first channel word it finds to every contact, so the second person is
+// silently credited to the wrong channel. Split into statements and resolve
+// each independently.
+//
+// The sentence split only fires on a period followed by whitespace and a
+// capital, so it cannot break an address like `jane.doe@acme.com`.
+function splitStatements(notes) {
+  return String(notes).split(/[;\n]+|\.\s+(?=[A-Z])/).filter(s => s.trim());
+}
+
+/**
+ * The candidate's own addresses, so a note that mentions them is not reported as somebody to chase.
+ *
+ * Tracker notes routinely cite your own mailbox while recording where a search ran — e.g. "searched
+ * both accounts (personal + me@work.example) for this thread" written to establish that a reply was
+ * NOT received. extractContacts has no concept of self, so it reads that as a repliable human and
+ * the row advertises a contact that cannot be written to. That is worse than reporting no contact:
+ * it makes an un-chaseable row look actionable.
+ *
+ * Read from config/profile.yml rather than hardcoded, so it stays correct per profile. Fails open —
+ * an absent or unreadable profile yields an empty set, because a missing profile must never start
+ * deleting real contacts.
+ */
+export function loadSelfIdentities(profilePath = PROFILE_FILE) {
+  if (!profilePath || !existsSync(profilePath)) return new Set();
+  let raw;
+  try {
+    raw = loadYaml(readFileSync(profilePath, 'utf-8')) || {};
+  } catch {
+    return new Set();
+  }
+  const out = new Set();
+  const push = (v) => { if (typeof v === 'string' && v.includes('@')) out.add(v.trim().toLowerCase()); };
+  push(raw.candidate?.email);
+  // Only iterate an actual array. A hand-edited profile can reasonably hold a mapping here
+  // (`alternate_emails: { work: me@example.com }`), and `for...of` on an object throws — at module
+  // load, because SELF_IDENTITIES is initialised at import time. That would take followup-cadence
+  // down entirely over a cosmetic config mistake, which is the opposite of the fail-open behaviour
+  // this function promises everywhere else.
+  const alternates = raw.candidate?.alternate_emails;
+  if (Array.isArray(alternates)) for (const alt of alternates) push(alt);
+  return out;
+}
+
+const SELF_IDENTITIES = loadSelfIdentities();
+
+export function extractContacts(notes, selfIdentities = SELF_IDENTITIES) {
+  if (!notes) return [];
+  const byEmail = new Map();  // normalized email -> contact
+  const byName = new Map();   // normalized name  -> contact
+  const contacts = [];
+
+  const add = ({ name, email, channel }) => {
+    const emailKey = email ? email.toLowerCase() : null;
+    const nameKey = name ? name.toLowerCase() : null;
+
+    // Same address recorded twice is one contact; fill in a name/channel the
+    // earlier mention lacked rather than emitting a duplicate.
+    const byEmailHit = emailKey ? byEmail.get(emailKey) : null;
+    const byNameHit = nameKey ? byName.get(nameKey) : null;
+
+    // A name-only and an email-only record can be created separately, then a
+    // later statement names BOTH and proves they are the same person. Fold the
+    // two records into one and drop the redundant entry, or the result reports
+    // two contacts where the note itself says there is one.
+    if (byEmailHit && byNameHit && byEmailHit !== byNameHit) {
+      byEmailHit.name = byEmailHit.name || byNameHit.name;
+      byEmailHit.email = byEmailHit.email || byNameHit.email;
+      byEmailHit.channel = byEmailHit.channel || byNameHit.channel;
+      const idx = contacts.indexOf(byNameHit);
+      if (idx !== -1) contacts.splice(idx, 1);
+      // Repoint every key that pointed at the discarded record.
+      for (const [k, v] of byEmail) if (v === byNameHit) byEmail.set(k, byEmailHit);
+      for (const [k, v] of byName) if (v === byNameHit) byName.set(k, byEmailHit);
+    }
+
+    const existing = byEmailHit || byNameHit || null;
+    if (existing) {
+      if (!existing.name && name) existing.name = name;
+      if (!existing.email && email) existing.email = email;
+      if (!existing.channel && channel) existing.channel = channel;
+      if (existing.email) byEmail.set(existing.email.toLowerCase(), existing);
+      if (existing.name) byName.set(existing.name.toLowerCase(), existing);
+      return;
+    }
+
+    const contact = { name: name ?? null, email: email ?? null, channel: channel ?? null };
+    contacts.push(contact);
+    if (emailKey) byEmail.set(emailKey, contact);
+    if (nameKey) byName.set(nameKey, contact);
+  };
+
+  for (const span of splitStatements(notes)) {
+    const emails = span.match(EMAIL_RE) || [];
+    const names = [...span.matchAll(OUTREACH_NAME_RE)].map(m => m[1].trim());
+    if (!emails.length && !names.length) continue;
+    const channel = detectChannel(span, emails.length > 0);
+
+    // One person and one address in the same statement is one contact, not an
+    // email-only entry plus a separate name-only duplicate.
+    if (names.length === 1 && emails.length === 1) {
+      add({ name: names[0], email: emails[0], channel });
+      continue;
+    }
+
+    for (const email of emails) {
+      // Fall back to the older "Emailed Name at <addr>" shape for a name that
+      // sits next to the address without a listed outreach verb.
+      let name = null;
+      const beforeEmail = span.substring(0, span.indexOf(email));
+      const nameMatch = beforeEmail.match(/(?:emailed|contact[:\s]+|to\s+)([A-Z][a-z]+ ?[A-Z]?[a-z]*)\s*(?:at|@|$)/i);
+      if (nameMatch) name = nameMatch[1].trim();
+      add({ name, email, channel });
+    }
+    for (const name of names) add({ name, email: null, channel });
+  }
+
+  // A note citing your own mailbox is not a person to follow up with.
+  return contacts.filter((c) => !(c.email && selfIdentities.has(c.email.toLowerCase())));
+}
+
+// The channel a single statement names, when it names one. Null rather than a
+// guess: an unspecified channel is not evidence of any particular one. An
+// address in the statement implies email only when no channel word says otherwise.
+function detectChannel(span, hasEmail = false) {
+  if (/\blinkedin\b/i.test(span)) return 'linkedin';
+  if (/\bphone\b|\bcalled\b/i.test(span)) return 'phone';
+  if (/\bemail(ed)?\b/i.test(span) || hasEmail) return 'email';
+  return null;
+}
+
+// Display label for a contact: the email when there is one, otherwise the name.
+// The summary table reads this instead of `.email` directly, so a name-only
+// contact shows the person rather than a literal "null".
+export function contactLabel(contact) {
+  if (!contact) return '-';
+  return contact.email || contact.name || '-';
 }
 
 // --- Resolve report path ---
-function resolveReportPath(reportField) {
-  const match = reportField.match(/\]\(([^)]+)\)/);
-  if (!match) return null;
-  // Report links in the tracker are normalized relative to the tracker file's
-  // own directory (see PR #760 — `merge-tracker.mjs --migrate`). Resolve against
-  // dirname(APPS_FILE), not the project root, otherwise relative paths like
-  // `../reports/...` (the data/applications.md layout) escape above the project.
-  const fullPath = join(dirname(APPS_FILE), match[1]);
-  return existsSync(fullPath) ? match[1] : null;
+export function resolveReportPath(reportField, appsFile = APPS_FILE, repoRoot = CAREER_OPS) {
+  const target = firstLinkTarget(reportField);
+  if (target == null) return null;
+  // Two shapes name the same file. Writers emit a repo-root link,
+  // `(reports/file.md)`, and merge-tracker rewrites it relative to the tracker
+  // directory, `(../reports/file.md)` (PR #760). Try the tracker-relative path
+  // first. A link with no `..` segment is also tried from the repo root, which
+  // is where the unmigrated shape actually lives. A `..` segment is not given
+  // that second try, so the link cannot walk out of reports/.
+  const candidates = [join(dirname(appsFile), target)];
+  if (!target.startsWith('/') && !target.split(/[\\/]/).includes('..')) {
+    const fromRoot = join(repoRoot, target);
+    if (fromRoot !== candidates[0]) candidates.push(fromRoot);
+  }
+  for (const fullPath of candidates) {
+    const repoRelative = relative(repoRoot, fullPath).split(sep).join('/');
+    if (repoRelative.startsWith('../') || repoRelative === '..' || !repoRelative.startsWith('reports/')) continue;
+    if (existsSync(fullPath)) return repoRelative;
+  }
+  return null;
 }
 
 // --- Compute urgency ---
+// For responded/assessment/interview, logged follow-ups CLEAR the overdue state and the
+// clock restarts from the last touch (re-overdue every responded_subsequent
+// days) — matching the cadence table in modes/followup.md ("Responded: every
+// 3 days · Assessment uses the responded cadence · Interview: thank-you, then
+// every 3 days, no limit").
 export function computeUrgency(status, daysSinceApp, daysSinceLastFollowup, followupCount) {
   if (status === 'applied') {
     if (followupCount >= CADENCE.applied_max_followups) return 'cold';
@@ -217,14 +1024,19 @@ export function computeUrgency(status, daysSinceApp, daysSinceLastFollowup, foll
     if (followupCount > 0 && daysSinceLastFollowup !== null && daysSinceLastFollowup >= CADENCE.applied_subsequent) return 'overdue';
     return 'waiting';
   }
-  if (status === 'responded') {
+  if (status === 'responded' || status === 'assessment') {
+    if (daysSinceLastFollowup !== null) {
+      return daysSinceLastFollowup >= CADENCE.responded_subsequent ? 'overdue' : 'waiting';
+    }
     if (daysSinceApp < CADENCE.responded_initial) return 'urgent';
     if (daysSinceApp >= CADENCE.responded_subsequent) return 'overdue';
     return 'waiting';
   }
   if (status === 'interview') {
-    if (daysSinceApp >= CADENCE.interview_thankyou) return 'overdue';
-    return 'waiting';
+    if (daysSinceLastFollowup !== null) {
+      return daysSinceLastFollowup >= CADENCE.responded_subsequent ? 'overdue' : 'waiting';
+    }
+    return daysSinceApp >= CADENCE.interview_thankyou ? 'overdue' : 'waiting';
   }
   return 'waiting';
 }
@@ -237,24 +1049,65 @@ export function computeNextFollowupDate(status, appDate, lastFollowupDate, follo
     if (lastFollowupDate) return addDays(parseDate(lastFollowupDate), CADENCE.applied_subsequent);
     return addDays(parseDate(appDate), CADENCE.applied_first);
   }
-  if (status === 'responded') {
+  if (status === 'responded' || status === 'assessment') {
     if (lastFollowupDate) return addDays(parseDate(lastFollowupDate), CADENCE.responded_subsequent);
-    return addDays(parseDate(appDate), CADENCE.responded_subsequent);
+    return addDays(parseDate(appDate), CADENCE.responded_initial);
   }
   if (status === 'interview') {
+    // After the thank-you is logged, subsequent touches follow the responded
+    // cadence (modes/followup.md: "Every 3 days · No limit").
+    if (lastFollowupDate) return addDays(parseDate(lastFollowupDate), CADENCE.responded_subsequent);
     return addDays(parseDate(appDate), CADENCE.interview_thankyou);
   }
   return null;
 }
 
 // --- Main analysis ---
-function analyze() {
-  const apps = parseTracker();
+// Content-based core so consumers outside this CLI (stats.mjs, tests) can
+// reuse the exact same cadence/urgency math — including the 'cold'
+// classification — without duplicating it or touching disk. `followupsContent`
+// missing/empty (the common case when data/follow-ups.md doesn't exist yet)
+// degrades gracefully: every app gets followupCount 0, so 'cold' (which
+// requires followupCount >= applied_max_followups) simply never triggers —
+// no error, no guessing, matching the same "absent optional file = pass
+// through" convention used elsewhere in this project.
+export function analyzeFromContent(trackerContent, followupsContent = '', { enabled = true, statusLogContent = '' } = {}) {
+  if (!enabled) {
+    return {
+      followupsEnabled: false,
+      metadata: { analysisDate: today().toISOString().split('T')[0], totalTracked: 0, actionable: 0, overdue: 0, urgent: 0, cold: 0, waiting: 0, retired: 0 },
+      entries: [],
+      cadenceConfig: CADENCE,
+      cadenceDefaults: DEFAULT_CADENCE,
+    };
+  }
+  const apps = parseTrackerContent(trackerContent);
   if (apps.length === 0) {
-    return { error: 'No applications found in tracker.' };
+    // cadenceDefaults rides along on the error. It is a constant, so it is just
+    // as valid with no applications as with a hundred, and this is the ONE
+    // state where a consumer cannot do without it: on a first run the web
+    // cadence form has no profile overrides to fall back on either, so
+    // withholding it renders six empty fields with nothing to type back in.
+    // The rest of the normal shape rides along too, zeroed, so a reader that
+    // skips `error` (the web follow-ups page) renders an empty tracker instead
+    // of "cadence unavailable".
+    return {
+      error: 'No applications found in tracker.',
+      noData: true,
+      metadata: {
+        analysisDate: today().toISOString().split('T')[0],
+        totalTracked: 0, actionable: 0, overdue: 0, urgent: 0, cold: 0, waiting: 0, retired: 0,
+      },
+      entries: [],
+      cadenceConfig: CADENCE,
+      cadenceDefaults: DEFAULT_CADENCE,
+    };
   }
 
-  const followups = parseFollowups();
+  const followups = parseFollowups(followupsContent);
+  const overrides = parseNextOverrides(String(followupsContent ?? ''));
+  const cleared = parseClearedDirectives(followupsContent);
+  const appliedOn = statusLogAppliedDates(statusLogContent);
 
   // Group follow-ups by app number
   const followupsByApp = new Map();
@@ -270,8 +1123,9 @@ function analyze() {
     const normalized = normalizeStatus(app.status);
     if (!ACTIONABLE_STATUSES.includes(normalized)) continue;
 
-    // Prefer the "Applied YYYY-MM-DD" date from notes; fall back to the column.
-    const appliedDate = parseAppliedDate(app.notes) || app.date;
+    // appDateSource travels with the entry so a consumer can tell a measured
+    // age from one inferred off the evaluation date.
+    const { appliedDate, appDateSource } = resolveAppliedDate(app, appliedOn.get(app.num));
     const appDate = parseDate(appliedDate);
     if (!appDate) continue;
 
@@ -279,18 +1133,37 @@ function analyze() {
     const appFollowups = followupsByApp.get(app.num) || [];
     const followupCount = appFollowups.length;
 
-    // Find most recent follow-up
+    // Find most recent follow-up (sorted date-desc; also exposed per entry so
+    // the web dashboard can render history without a second parser).
     let lastFollowupDate = null;
     let daysSinceLastFollowup = null;
-    if (appFollowups.length > 0) {
-      const sorted = appFollowups.sort((a, b) => (a.date > b.date ? -1 : 1));
-      lastFollowupDate = sorted[0].date;
+    const sortedFollowups = [...appFollowups].sort((a, b) => (a.date > b.date ? -1 : 1));
+    if (sortedFollowups.length > 0) {
+      lastFollowupDate = sortedFollowups[0].date;
       const lastDate = parseDate(lastFollowupDate);
       if (lastDate) daysSinceLastFollowup = daysBetween(lastDate, now);
     }
 
-    const urgency = computeUrgency(normalized, daysSinceApp, daysSinceLastFollowup, followupCount);
-    const nextFollowupDate = computeNextFollowupDate(normalized, appliedDate, lastFollowupDate, followupCount);
+    let urgency = computeUrgency(normalized, daysSinceApp, daysSinceLastFollowup, followupCount);
+    let nextFollowupDate = computeNextFollowupDate(normalized, appliedDate, lastFollowupDate, followupCount);
+
+    // A pinned next-date takes precedence over the computed cadence (explicit
+    // user intent — it even revives a cold application) until a follow-up
+    // logged after the pin resumes the normal schedule.
+    const nextOverride = resolveNextOverride(overrides.get(app.num), lastFollowupDate);
+    if (nextOverride) {
+      nextFollowupDate = nextOverride;
+      urgency = daysBetween(parseDate(nextOverride), now) >= 0 ? 'overdue' : 'waiting';
+    }
+
+    // A retirement outranks a pin: it means "there is no channel here", which
+    // no computed or pinned date can make true.
+    const retired = isRetired(cleared.get(app.num), lastFollowupDate);
+    if (retired) {
+      urgency = 'retired';
+      nextFollowupDate = null;
+    }
+
     const nextDate = nextFollowupDate ? parseDate(nextFollowupDate) : null;
     const daysUntilNext = nextDate ? daysBetween(now, nextDate) : null;
 
@@ -301,7 +1174,14 @@ function analyze() {
       num: app.num,
       date: app.date,
       appliedDate,
+      appDateSource,
       company: app.company,
+      // Intermediary channel (#1596): agency name when the application went
+      // through an intermediary, null for a direct application (the tracker's
+      // `—` placeholder and the no-Via-column case both normalize to null, so
+      // consumers never learn the sentinel). When set, follow-ups chase the
+      // agency contact, not the company.
+      via: app.via && app.via !== '—' ? app.via : null,
       role: app.role,
       status: normalized,
       score: app.score,
@@ -311,37 +1191,70 @@ function analyze() {
       daysSinceApplication: daysSinceApp,
       daysSinceLastFollowup,
       followupCount,
+      followups: sortedFollowups,
       urgency,
       nextFollowupDate,
+      nextOverride,
       daysUntilNext,
     });
   }
 
-  // Sort by urgency priority: urgent > overdue > waiting > cold
   const urgencyOrder = { urgent: 0, overdue: 1, waiting: 2, cold: 3 };
-  entries.sort((a, b) => (urgencyOrder[a.urgency] ?? 9) - (urgencyOrder[b.urgency] ?? 9));
+  const byPressure = (a, b) =>
+    (urgencyOrder[a.urgency] ?? 9) - (urgencyOrder[b.urgency] ?? 9)
+    || (a.daysUntilNext ?? Infinity) - (b.daysUntilNext ?? Infinity)
+    || b.daysSinceApplication - a.daysSinceApplication
+    || a.num - b.num;
+  entries.sort(byPressure);
+
+  // Retired applications are counted but not listed — surfacing them in the
+  // entries array would defeat the point of retiring them, and the count keeps
+  // the retirement visible enough to be reconsidered.
+  const retiredCount = entries.filter(e => e.urgency === 'retired').length;
+  const active = entries.filter(e => e.urgency !== 'retired');
 
   const filtered = overdueOnly
-    ? entries.filter(e => e.urgency === 'overdue' || e.urgency === 'urgent')
-    : entries;
+    ? active.filter(e => e.urgency === 'overdue' || e.urgency === 'urgent')
+    : active;
 
   return {
     metadata: {
       analysisDate: now.toISOString().split('T')[0],
       totalTracked: apps.length,
-      actionable: entries.length,
-      overdue: entries.filter(e => e.urgency === 'overdue').length,
-      urgent: entries.filter(e => e.urgency === 'urgent').length,
-      cold: entries.filter(e => e.urgency === 'cold').length,
-      waiting: entries.filter(e => e.urgency === 'waiting').length,
+      actionable: active.length,
+      overdue: active.filter(e => e.urgency === 'overdue').length,
+      urgent: active.filter(e => e.urgency === 'urgent').length,
+      cold: active.filter(e => e.urgency === 'cold').length,
+      waiting: active.filter(e => e.urgency === 'waiting').length,
+      retired: retiredCount,
     },
     entries: filtered,
     cadenceConfig: CADENCE,
+    // The EFFECTIVE cadence above is defaults+profile overrides. Consumers that
+    // need to show what a value would be WITHOUT the user's override (the web
+    // settings form's placeholder) need the pure defaults too — sourcing that
+    // placeholder from cadenceConfig would render a user's own override as the
+    // default they'd be reverting to. Emitting both is what lets the web stop
+    // hand-copying DEFAULT_CADENCE (#2369).
+    cadenceDefaults: DEFAULT_CADENCE,
   };
+}
+
+// --- Main analysis (disk-backed CLI entry point) ---
+function analyze() {
+  if (!loadFollowupsEnabled()) return analyzeFromContent('', '', { enabled: false });
+  const trackerContent = existsSync(APPS_FILE) ? readFileSync(APPS_FILE, 'utf-8') : '';
+  const followupsContent = existsSync(FOLLOWUPS_FILE) ? readFileSync(FOLLOWUPS_FILE, 'utf-8') : '';
+  const statusLogContent = existsSync(STATUS_LOG_FILE) ? readFileSync(STATUS_LOG_FILE, 'utf-8') : '';
+  return analyzeFromContent(trackerContent, followupsContent, { enabled: loadFollowupsEnabled(), statusLogContent });
 }
 
 // --- Summary mode ---
 function printSummary(result) {
+  if (result.followupsEnabled === false) {
+    console.log('\nFollow-ups are turned off (follow_ups.enabled: false in config/profile.yml).\n');
+    return;
+  }
   if (result.error) {
     console.log(`\n${result.error}\n`);
     return;
@@ -370,7 +1283,7 @@ function printSummary(result) {
   for (const e of entries) {
     const urgLabel = urgencyIcon[e.urgency] || e.urgency;
     const nextStr = e.nextFollowupDate || '-';
-    const contactStr = e.contacts.length > 0 ? e.contacts[0].email : '-';
+    const contactStr = e.contacts.length > 0 ? contactLabel(e.contacts[0]) : '-';
     console.log(
       '  ' +
       String(e.num).padEnd(5) +
@@ -387,15 +1300,56 @@ function printSummary(result) {
   console.log('');
 }
 
+// ── CLI flags + help ────────────────────────────────────────────────
+
+// --json is the DEFAULT output form, not a mode switch: it names what the
+// script already does with no flag at all. It is listed here because callers
+// pass it explicitly — web/src/app/api/followups/route.ts and
+// web/src/app/api/followups/cadence/route.ts both spawn `[script, '--json']`
+// — and validateFlags() rejects any flag not on this list, so omitting it
+// made both routes exit 1 and read as "no follow-ups" (#3196 added the
+// validation without the flag the web already passed).
+const KNOWN_FLAGS = ['--summary', '--json', '--overdue-only', '--applied-days', '--help', '-h'];
+const VALUE_FLAGS = ['--applied-days'];
+
+const USAGE = `Usage:
+  node followup-cadence.mjs                    # full JSON analysis to stdout
+  node followup-cadence.mjs --json             # same as above, JSON is the default
+  node followup-cadence.mjs --summary          # human-readable dashboard (wins over --json)
+  node followup-cadence.mjs --overdue-only     # only show overdue/urgent entries
+  node followup-cadence.mjs --applied-days 10  # override applied_first cadence (days)
+  node followup-cadence.mjs --help|-h          # print this usage block and exit`;
+
 // --- Run (CLI only; guarded so the module is safely importable for tests) ---
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
+  // Must run inside this guard, not at module top level: CADENCE (above) is a
+  // module-level singleton built at import time, and test-all.mjs section 12
+  // dynamic-imports this module in-process to read it — validating the host
+  // process's own argv there would false-positive on the test runner's flags.
+  validateFlags(args, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS, requireOperand: true });
+
+  // positiveInteger() (used to build CADENCE above) treats a NaN/negative value
+  // as "absent" and silently keeps the default — exactly the wrong-answer-at-
+  // exit-0 shape this fix exists to close. A value that was actually SUPPLIED
+  // must fail loudly instead of being swallowed the same way a bad flag NAME
+  // used to be.
+  if (appliedDaysRaw !== undefined && !(Number.isFinite(appliedDaysOverride) && appliedDaysOverride >= 0)) {
+    console.error(`Error: --applied-days requires a non-negative integer, got "${appliedDaysRaw}"`);
+    process.exit(1);
+  }
+
   const result = analyze();
 
+  // --summary wins when both are given: it is the flag that asks for something
+  // other than the default, so it is the one carrying an intention.
   if (summaryMode) {
     printSummary(result);
   } else {
     console.log(JSON.stringify(result, null, 2));
   }
 
-  if (result.error) process.exit(1);
+  // An empty tracker is a new user, not a failure. analyze-patterns.mjs and the
+  // other tracker readers exit 0 here too; exiting 1 made the web dashboard read
+  // a first run as "cadence unavailable".
+  if (result.error && !result.noData) process.exit(1);
 }

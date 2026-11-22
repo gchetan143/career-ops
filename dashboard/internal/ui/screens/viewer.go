@@ -1,34 +1,58 @@
 package screens
 
 import (
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/table"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/santifer/career-ops/dashboard/internal/data"
+	"github.com/santifer/career-ops/dashboard/internal/i18n"
+	"github.com/santifer/career-ops/dashboard/internal/model"
 	"github.com/santifer/career-ops/dashboard/internal/theme"
 )
 
 // ViewerClosedMsg is emitted when the viewer is dismissed.
 type ViewerClosedMsg struct{}
 
+// ViewerOpenCoverLetterMsg is emitted when the user requests to open the cover letter PDF.
+type ViewerOpenCoverLetterMsg struct{ Path string }
+
+// ViewerUpdateStatusMsg is emitted when a status update is requested from the viewer.
+type ViewerUpdateStatusMsg struct {
+	App       model.CareerApplication
+	NewStatus string
+}
+
 // ViewerModel implements an integrated file viewer screen.
 type ViewerModel struct {
-	lines         []string
-	renderedLines []string
-	title         string
-	scrollOffset  int
-	width         int
-	height        int
-	theme         theme.Theme
+	lines           []string
+	renderedLines   []string
+	title           string
+	scrollOffset    int
+	width           int
+	height          int
+	theme           theme.Theme
+	app             model.CareerApplication
+	careerOpsPath   string
+	coverLetterPath string
+	jobURL          string
+	statusPicker    bool
+	statusCursor    int
+	// flash is a one-shot notice rendered in place of the footer, cleared on
+	// the next key press (same contract as the pipeline screen's flash).
+	flash string
 }
 
 // NewViewerModel creates a new file viewer for the given path.
-func NewViewerModel(t theme.Theme, path, title string, width, height int) ViewerModel {
+func NewViewerModel(t theme.Theme, careerOpsPath, path, title string, width, height int, app model.CareerApplication) ViewerModel {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		content = []byte("Error reading file: " + err.Error())
@@ -38,16 +62,71 @@ func NewViewerModel(t theme.Theme, path, title string, width, height int) Viewer
 	if len(content) > 0 {
 		lines = strings.Split(string(content), "\n")
 	}
+	for i, line := range lines {
+		lines[i] = data.SanitizeTerminalText(line)
+	}
 
 	m := ViewerModel{
-		lines:  lines,
-		title:  title,
-		width:  width,
-		height: height,
-		theme:  t,
+		lines:           lines,
+		title:           data.SanitizeTerminalText(title),
+		width:           width,
+		height:          height,
+		theme:           t,
+		app:             app,
+		careerOpsPath:   careerOpsPath,
+		coverLetterPath: parseCoverLetterPath(lines, careerOpsPath),
+		jobURL:          resolveJobURL(app, lines),
 	}
 	m.rebuildRender()
 	return m
+}
+
+// parseCoverLetterPath scans the report lines for a "PDF generated: output/..." line
+// inside a "## Cover Letter Draft" section and returns the relative path if the file exists.
+func parseCoverLetterPath(lines []string, careerOpsPath string) string {
+	inCoverSection := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## Cover Letter Draft") {
+			inCoverSection = true
+			continue
+		}
+		if inCoverSection && strings.HasPrefix(trimmed, "## ") {
+			break
+		}
+		if inCoverSection {
+			if m := reCoverLetterPDF.FindStringSubmatch(line); m != nil {
+				relPath := m[1]
+				abs := filepath.Join(careerOpsPath, filepath.FromSlash(relPath))
+				if _, err := os.Stat(abs); err == nil {
+					return relPath
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// resolveJobURL returns the posting URL for the open report: the tracker row's
+// JobURL when it is a usable web URL, else the first usable **URL:** header
+// line in the report. Anything else (a hostless "https://?x", a local:jds/
+// pointer) is skipped rather than handed to the platform opener.
+func resolveJobURL(app model.CareerApplication, lines []string) string {
+	if isWebURL(app.JobURL) {
+		return app.JobURL
+	}
+	for _, line := range lines {
+		if sm := reReportURLLine.FindStringSubmatch(strings.TrimSpace(line)); sm != nil && isWebURL(sm[1]) {
+			return sm[1]
+		}
+	}
+	return ""
+}
+
+// isWebURL reports whether raw is an absolute http(s) URL with a host.
+func isWebURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 // rebuildRender recomputes renderedLines from raw lines using the current width.
@@ -81,10 +160,33 @@ func (m *ViewerModel) Resize(width, height int) {
 
 func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	switch msg := msg.(type) {
+	case StatusUpdateFailedMsg:
+		m.flash = "Could not update status: " + msg.Err
+		return m, nil
 	case tea.KeyMsg:
+		m.flash = ""
+		if m.statusPicker {
+			return m.handleStatusPicker(msg)
+		}
 		switch msg.String() {
 		case "q", "esc":
 			return m, func() tea.Msg { return ViewerClosedMsg{} }
+
+		case "o":
+			if m.jobURL == "" {
+				m.flash = "No URL found for this application"
+				break
+			}
+			url := m.jobURL
+			return m, func() tea.Msg { return PipelineOpenURLMsg{URL: url} }
+
+		case "c":
+			m.statusPicker = true
+			// The picker's own current-status-first reordering (see
+			// getStatusPairs) always places this row's status at index 0.
+			m.statusCursor = 0
+			m.clampScrollOffset()
+			return m, nil
 
 		case "down", "j":
 			maxScroll := len(m.renderedLines) - m.bodyHeight()
@@ -127,12 +229,23 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				maxScroll = 0
 			}
 			m.scrollOffset = maxScroll
+
+		case "L":
+			if m.coverLetterPath != "" {
+				fullPath := filepath.Join(m.careerOpsPath, filepath.FromSlash(m.coverLetterPath))
+				return m, func() tea.Msg { return ViewerOpenCoverLetterMsg{Path: fullPath} }
+			}
 		}
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		m.rebuildRender()
+
+	case PipelineOpenFailedMsg:
+		// Issue 3913: main.go routes this to the active screen; while the
+		// viewer is open, the pipeline's flash line is not on screen.
+		m.flash = "Could not open " + msg.Target + ": " + msg.Err
 	}
 
 	return m, nil
@@ -140,6 +253,9 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 
 func (m ViewerModel) bodyHeight() int {
 	h := m.height - 4 // header + footer + padding
+	if m.statusPicker {
+		h -= (len(m.currentStatusPairs()) + 1)
+	}
 	if h < 3 {
 		h = 3
 	}
@@ -149,6 +265,9 @@ func (m ViewerModel) bodyHeight() int {
 func (m ViewerModel) View() string {
 	header := m.renderHeader()
 	body := m.renderBody()
+	if m.statusPicker {
+		body = m.overlayStatusPicker(body)
+	}
 	footer := m.renderFooter()
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
@@ -159,7 +278,6 @@ func (m ViewerModel) renderHeader() string {
 		Bold(true).
 		Foreground(m.theme.Text).
 		Background(m.theme.Surface).
-		Width(m.width).
 		Padding(0, 2)
 
 	title := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Blue).Render(m.title)
@@ -186,12 +304,7 @@ func (m ViewerModel) renderHeader() string {
 		}()
 	}())
 
-	gap := m.width - lipgloss.Width(m.title) - lipgloss.Width(scroll) - 4
-	if gap < 1 {
-		gap = 1
-	}
-
-	return style.Render(title + strings.Repeat(" ", gap) + scroll)
+	return oneLine(m.width, style, fitTitleBar(m.width, title, scroll))
 }
 
 func (m ViewerModel) renderBody() string {
@@ -298,7 +411,7 @@ func (m ViewerModel) renderAll() []string {
 			flat = append(flat, s)
 		}
 	}
-	return flat
+	return balanceHyperlinks(flat)
 }
 
 func isTableLine(line string) bool {
@@ -417,11 +530,14 @@ func (m ViewerModel) renderTableBlock(lines []string) []string {
 }
 
 var (
-	reBold       = regexp.MustCompile(`\*\*([^*]+)\*\*`)
-	reLink       = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
-	reBareURL    = regexp.MustCompile(`https?://\S*[^\s\)\]\.,;:!?]`)
-	reInlineCode = regexp.MustCompile("`([^`]+)`")
-	reListNumber = regexp.MustCompile(`^(\s*\d+\.\s+)(.*)$`)
+	reBold           = regexp.MustCompile(`\*\*([^*]+)\*\*`)
+	reLink           = regexp.MustCompile(`\[([^\]]+)\]\(((?:[^()]|\([^()]*\))+)\)`) // one level of balanced parens in the destination, as CommonMark allows
+	reBareURL        = regexp.MustCompile(`https?://\S*[^\s\)\]\.,;:!?]`)
+	reInlineCode     = regexp.MustCompile("`([^`]+)`")
+	reListNumber     = regexp.MustCompile(`^(\s*\d+\.\s+)(.*)$`)
+	reCoverLetterPDF = regexp.MustCompile(`PDF generated:\s*(output/[^\s]+\.pdf)`)
+	reReportURLLine  = regexp.MustCompile(`^\*\*URL:\*\*\s*(\S+)`)
+	reRelPDFPath     = regexp.MustCompile(`output/cv-[^\s\)\]\.,;:!?"']+\.pdf`)
 )
 
 func isHeadingLine(line string) bool {
@@ -470,7 +586,7 @@ func (m ViewerModel) renderInlineElementsAs(line string, baseColor lipgloss.Colo
 	var b strings.Builder
 	rest := line
 	for rest != "" {
-		match := findInlineMatch(rest, codeStyle, boldStyle, linkStyle)
+		match := findInlineMatch(rest, codeStyle, boldStyle, linkStyle, m.careerOpsPath)
 		if match == nil {
 			b.WriteString(baseStyle.Render(rest))
 			break
@@ -489,7 +605,7 @@ type inlineMatch struct {
 	rendered   string
 }
 
-func findInlineMatch(s string, codeStyle, boldStyle, linkStyle lipgloss.Style) *inlineMatch {
+func findInlineMatch(s string, codeStyle, boldStyle, linkStyle lipgloss.Style, careerOpsPath string) *inlineMatch {
 	var best *inlineMatch
 	consider := func(loc []int, rendered func() string) {
 		if loc == nil || (best != nil && loc[0] >= best.start) {
@@ -507,16 +623,147 @@ func findInlineMatch(s string, codeStyle, boldStyle, linkStyle lipgloss.Style) *
 	if loc := reLink.FindStringIndex(s); loc != nil {
 		consider(loc, func() string {
 			sm := reLink.FindStringSubmatch(s[loc[0]:loc[1]])
-			if len(sm) >= 2 {
-				return linkStyle.Render(sm[1])
+			if len(sm) >= 3 {
+				return webHyperlink(markdownLinkTarget(sm[2]), linkStyle.Render(sm[1]))
 			}
 			return s[loc[0]:loc[1]]
 		})
 	}
 	if loc := reBareURL.FindStringIndex(s); loc != nil {
-		consider(loc, func() string { return linkStyle.Render(s[loc[0]:loc[1]]) })
+		consider(loc, func() string {
+			bare := s[loc[0]:loc[1]]
+			return webHyperlink(bare, linkStyle.Render(bare))
+		})
+	}
+	if loc := reRelPDFPath.FindStringIndex(s); loc != nil {
+		consider(loc, func() string {
+			relPath := s[loc[0]:loc[1]]
+			styled := linkStyle.Render(relPath)
+			if careerOpsPath == "" {
+				return styled
+			}
+			joined := filepath.Join(careerOpsPath, filepath.FromSlash(relPath))
+			absPath, err := filepath.Abs(joined)
+			if err != nil {
+				return styled
+			}
+			forward := filepath.ToSlash(absPath)
+			if !strings.HasPrefix(forward, "/") {
+				forward = "/" + forward // Windows: C:/... → /C:/...
+			}
+			return hyperlink("file://"+forward, styled)
+		})
 	}
 	return best
+}
+
+// OSC 8 hyperlinks: ESC ] 8 ; params ; URI BEL text ESC ] 8 ; ; BEL.
+// Terminals that support them (iTerm2, WezTerm, kitty, VS Code, Windows
+// Terminal, recent GNOME Terminal) make the text clickable; others ignore the
+// sequence and show the text as before.
+const osc8Close = "\x1b]8;;\x07"
+
+const upperHex = "0123456789ABCDEF"
+
+// reOSC8 matches one OSC 8 sequence, terminated by BEL or ST (pipeline.go's
+// manifesto link uses ST). Group 2 is the URI; an empty URI closes the link.
+var reOSC8 = regexp.MustCompile("\x1b\\]8;([^;\x07\x1b]*);([^\x07\x1b]*)(?:\x07|\x1b\\\\)")
+
+// hyperlink wraps already-styled text in an OSC 8 hyperlink to target. When
+// the target cannot be carried safely it returns styled unchanged, so the text
+// still renders, just not as a link.
+func hyperlink(target, styled string) string {
+	uri, ok := osc8URI(target)
+	if !ok {
+		return styled
+	}
+	return "\x1b]8;;" + uri + "\x07" + styled + osc8Close
+}
+
+// webHyperlink links styled to rawURL only when rawURL is an absolute http(s)
+// URL. Report text is derived from job postings, which are untrusted input, so
+// a markdown link to javascript:, file:, data: or a relative path stays plain.
+func webHyperlink(rawURL, styled string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return styled
+	}
+	return hyperlink(rawURL, styled)
+}
+
+// markdownLinkTarget extracts the destination from a markdown link's (...)
+// part, dropping an optional title (`[x](https://a "Title")`) and the angle
+// brackets of `[x](<https://a>)`.
+func markdownLinkTarget(dest string) string {
+	dest = strings.TrimSpace(dest)
+	if strings.HasPrefix(dest, "<") {
+		if end := strings.IndexByte(dest, '>'); end > 0 {
+			return dest[1:end]
+		}
+	}
+	if fields := strings.Fields(dest); len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
+}
+
+// osc8URI makes target safe to embed in an OSC 8 sequence. Any control
+// character (C0, DEL, C1) rejects the target outright: ESC or BEL would end
+// the sequence early and let the rest of the URL reach the terminal as
+// commands (see sanitizeFlash, #4027). The OSC 8 spec limits URIs to bytes
+// 32-126, so spaces and non-ASCII bytes are percent-encoded rather than
+// dropped, which keeps file:// links to paths like "My Drive" working.
+func osc8URI(target string) (string, bool) {
+	if target == "" || !utf8.ValidString(target) {
+		return "", false
+	}
+	var b strings.Builder
+	for _, r := range target {
+		switch {
+		case r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f:
+			return "", false
+		case r == ' ' || r > 0x7e:
+			for _, c := range []byte(string(r)) {
+				b.WriteByte('%')
+				b.WriteByte(upperHex[c>>4])
+				b.WriteByte(upperHex[c&0x0f])
+			}
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String(), true
+}
+
+// balanceHyperlinks makes every rendered line carry its own complete OSC 8
+// hyperlinks. ansi.Wrap keeps a link's opening and closing sequences where
+// they were, so a URL wrapped over three lines opens on the first and closes
+// on the last. The viewer draws and scrolls lines independently, so when the
+// first line is scrolled off the rest is not clickable, and when the last is
+// off the link never closes and the footer becomes part of it. This closes an
+// open link at the end of each line and reopens it at the start of the next.
+// Lines that are already balanced (lipgloss tables do this) are unchanged.
+func balanceHyperlinks(lines []string) []string {
+	out := make([]string, len(lines))
+	open := "" // opening sequence of the link still active at end of line
+	for i, line := range lines {
+		carried := open
+		for _, sm := range reOSC8.FindAllStringSubmatch(line, -1) {
+			if sm[2] == "" {
+				open = ""
+			} else {
+				open = sm[0]
+			}
+		}
+		if carried != "" {
+			line = carried + line
+		}
+		if open != "" {
+			line += osc8Close
+		}
+		out[i] = line
+	}
+	return out
 }
 
 func (m ViewerModel) styleLine(line string) string {
@@ -612,15 +859,128 @@ func (m ViewerModel) renderFooter() string {
 	style := lipgloss.NewStyle().
 		Foreground(m.theme.Subtext).
 		Background(m.theme.Surface).
-		Width(m.width).
 		Padding(0, 1)
+
+	budget := m.width - 2
+	if budget < 1 {
+		budget = 1
+	}
+
+	if m.flash != "" {
+		return oneLine(m.width, style.Foreground(m.theme.Yellow), fitPlain(budget, sanitizeFlash(m.flash)))
+	}
 
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Text)
 	descStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
+	piece := func(key, desc string, pin bool) helpPiece {
+		return helpPiece{text: keyStyle.Render(key) + descStyle.Render(desc), pin: pin}
+	}
 
-	return style.Render(
-		keyStyle.Render("↑↓") + descStyle.Render(" scroll  ") +
-			keyStyle.Render("PgUp/Dn") + descStyle.Render(" page  ") +
-			keyStyle.Render("g/G") + descStyle.Render(" top/end  ") +
-			keyStyle.Render("Esc") + descStyle.Render(" back"))
+	if m.statusPicker {
+		return oneLine(m.width, style, joinHelp(budget, []helpPiece{
+			piece("↑/↓/j/k", i18n.Current.HelpNav, false),
+			piece("Enter", i18n.Current.HelpConfirm, false),
+			piece("Esc/q", i18n.Current.HelpCancel, true),
+		}, "", ""))
+	}
+
+	pieces := []helpPiece{
+		piece("↑↓", i18n.Current.HelpScroll, false),
+		piece("PgUp/Dn", i18n.Current.HelpPage, false),
+		piece("g/G", i18n.Current.HelpTopEnd, false),
+		piece("c", i18n.Current.HelpChange, false),
+	}
+	if hint := m.openURLHint(keyStyle, descStyle); hint != "" {
+		pieces = append(pieces, helpPiece{text: hint})
+	}
+	pieces = append(pieces,
+		piece("t", i18n.Current.HelpLanguage, false),
+		piece("Esc", i18n.Current.HelpBack, true),
+	)
+	if m.coverLetterPath != "" {
+		pieces = append(pieces, helpPiece{text: "  " + keyStyle.Render("L") + descStyle.Render(" cover letter")})
+	}
+
+	return oneLine(m.width, style, joinHelp(budget, pieces, "", ""))
+}
+
+// openURLHint shows the `o` shortcut only when the report has a posting URL.
+func (m ViewerModel) openURLHint(keyStyle, descStyle lipgloss.Style) string {
+	if m.jobURL == "" {
+		return ""
+	}
+	return keyStyle.Render("o") + descStyle.Render(i18n.Current.HelpOpenURL)
+}
+
+func (m ViewerModel) handleStatusPicker(msg tea.KeyMsg) (ViewerModel, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.statusPicker = false
+		m.clampScrollOffset()
+		return m, nil
+
+	case "down", "j":
+		m.statusCursor++
+		if m.statusCursor >= len(m.currentStatusPairs()) {
+			m.statusCursor = len(m.currentStatusPairs()) - 1
+		}
+
+	case "up", "k":
+		m.statusCursor--
+		if m.statusCursor < 0 {
+			m.statusCursor = 0
+		}
+
+	case "enter":
+		m.statusPicker = false
+		m.clampScrollOffset()
+		newStatus := m.currentStatusPairs()[m.statusCursor].Canonical
+		return m, func() tea.Msg {
+			return ViewerUpdateStatusMsg{
+				App:       m.app,
+				NewStatus: newStatus,
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m ViewerModel) overlayStatusPicker(body string) string {
+	bodyLines := strings.Split(body, "\n")
+
+	pickerWidth := 30
+	padStyle := lipgloss.NewStyle().Padding(0, 2)
+	borderStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Blue).
+		Bold(true)
+
+	var picker []string
+	picker = append(picker, padStyle.Render(borderStyle.Render(i18n.Current.PickerChangeStatus)))
+
+	for i, pair := range m.currentStatusPairs() {
+		style := lipgloss.NewStyle().Foreground(m.theme.Text).Width(pickerWidth)
+		if i == m.statusCursor {
+			style = style.Background(m.theme.Overlay).Bold(true)
+		}
+		prefix := "  "
+		if i == m.statusCursor {
+			prefix = " >"
+		}
+		picker = append(picker, padStyle.Render(prefix+style.Render(pair.Display)))
+	}
+
+	bodyLines = append(bodyLines, picker...)
+	return strings.Join(bodyLines, "\n")
+}
+
+// currentStatusPairs resolves the status-change picker options for the
+// application currently open in the viewer, so the picker leads with this
+// row's own status (see getStatusPairs).
+func (m ViewerModel) currentStatusPairs() []StatusPair {
+	return getStatusPairs(data.NormalizeStatus(m.app.Status))
+}
+
+// UpdateAppStatus updates the status of the current application inside the viewer model.
+func (m *ViewerModel) UpdateAppStatus(newStatus string) {
+	m.app.Status = newStatus
 }
